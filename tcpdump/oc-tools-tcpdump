@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+set -u -e -o pipefail
+
+declare -r TCPDUMP_NS=tcpdump-pcap-$(openssl rand -hex 4)
+declare  -r LOCAL_PCAP_DIR="pcaps/$(date -u +%Y%m%d-%H%M%S-utc)"
+declare  -r NODE_PCAP_FILE="/tmp/node.pcap"
+
+### ARRAY that maintains all the debug pods that is started
+declare -a PODS=()
+
+declare -a TCPDUMP_PIDS=()
+declare -a DEBUG_PODS=()
+declare -a NODE_NAMES=()
+
+log() {
+  local level=$1; shift
+  echo $(date -u +"%Y-%m-%dT%H:%M:%S") " $level: $@"
+}
+
+info() {
+  log INFO "$@"
+}
+
+warn() {
+  log WARN "$@"
+}
+
+err() {
+  log ERROR "$@" >&2
+}
+
+# quote the argument
+qq() {
+  echo "\"$@\""
+}
+
+h1() {
+  echo -e "\n#  $@"
+  echo "======================================================="
+}
+
+h2() {
+  echo -e "\n*  $@"
+  echo "-------------------------------------------------------"
+}
+
+
+CLEANUP_IN_PROGRESS=false
+cleanup() {
+  local capture_node_packets=$1; shift
+
+  h1 "Gathering all pcaps and cleaning up ..."
+  $CLEANUP_IN_PROGRESS && return 0
+
+  CLEANUP_IN_PROGRESS=true
+
+  info "Shutting down tcpdump and copying pcaps"
+  info "Please wait until all the pcaps are copied to $LOCAL_PCAP_DIR"
+
+  ### DO NOT EXIT on ERRORS
+  #set +e
+  stop_listening
+
+  sleep 3  ### requires time to flush
+  cp_pcaps $capture_node_packets
+  delete_debug_pods
+
+
+  h2 "All pcaps have been copied to $LOCAL_PCAP_DIR"
+  echo -e "\n====================xxxXxxx=========================="
+}
+
+
+stop_listening() {
+  h2  "Stopping tcpdump on all pods"
+
+  for pod in ${DEBUG_PODS[@]}; do
+    pod_exec $TCPDUMP_NS $pod  kill_tcpdump &
+  done
+
+  # This shouldn't be necessary if the the above kills the
+  # tcpdump but to be on the safe side, ensure all background
+  # processes are killed and reaped as well
+  for pid in ${TCPDUMP_PIDS[@]}; do
+    info "sending kill to $pid"
+    { kill -TERM $pid 2>/dev/null || true; } &
+  done
+  wait
+}
+
+cp_pcaps() {
+  local capture_node_packets=$1; shift
+  local pod_pcap="$(container_name).pcap"
+
+  h2 "Copying $pod_pcap to $LOCAL_PCAP_DIR"
+
+  mkdir -p "$LOCAL_PCAP_DIR"
+
+  local idx=0
+  for pod in ${DEBUG_PODS[@]}; do
+    # local file should have the <node>-<pod>.pcap and <node>.pcap name
+    local node="${NODE_NAMES[$idx]}"
+    local local_pod_pcap="$node-$pod_pcap"
+
+    $capture_node_packets && {
+      local local_node_pcap="$node.pcap"
+      info "$pod:$(basename $NODE_PCAP_FILE) -> $local_node_pcap"
+      oc cp -n $TCPDUMP_NS $pod:${NODE_PCAP_FILE##/} "$LOCAL_PCAP_DIR/$local_node_pcap"
+    }
+
+    #set -x
+    info "$pod:$pod_pcap -> $local_pod_pcap"
+    oc cp -n $TCPDUMP_NS "$pod:tmp/$pod_pcap" "$LOCAL_PCAP_DIR/$local_pod_pcap"
+    (( idx++ )) || true   ### something is wrong; why does this error ?
+  done
+}
+
+delete_debug_pods() {
+  h2 "Deleting all debug pods "
+
+  for pod in ${DEBUG_PODS[@]}; do
+    info "Deleting pod $pod"
+    oc delete -n $TCPDUMP_NS pod $pod &
+  done
+  wait
+  oc delete ns $TCPDUMP_NS
+}
+
+start_debug_node() {
+  local node=$1; shift
+
+  info "Starting a debug pod for node: $node"
+
+
+  local pod_manifest=$( oc debug "node/$node" \
+     --to-namespace="$TCPDUMP_NS" \
+     -o json -- sleep infinity )
+  local pod_name=$(echo $pod_manifest | jq -r '.metadata.name')
+
+  info "started debug pod $pod_name on $node"
+
+  DEBUG_PODS+=( $pod_name )
+  NODE_NAMES+=( $node )   ### maintain same index
+
+  echo $pod_manifest | oc apply -f-
+  oc wait --timeout=120s --for=condition=Ready -n $TCPDUMP_NS "pod/$pod_name"
+  return 0
+}
+
+
+pod.info() {
+  log INFO "  >> $@"
+}
+
+pod.warn() {
+  log WARN "  >> $@"
+}
+
+pod.err() {
+  log ERROR " >> $@" >&2
+}
+
+
+pod.kill_tcpdump() {
+  pkill tcpdump
+}
+
+pod.crictl() {
+  chroot /host crictl "$@"
+}
+
+pod.run() {
+  pod.info "running: $@"
+  "$@"
+}
+
+pod.tcpdump_node() {
+  pod.run tcpdump -i any -nn -w /tmp/node.pcap
+}
+
+pod.tcpdump_pod() {
+  local container=$1; shift
+
+  local jq=".containers[]
+    | select(.labels[$(qq io.kubernetes.container.name)] == $(qq $container))
+    | .id"
+
+  local container_id=$(pod.crictl ps -o json | jq -r "$jq")
+  [[ -z "$container_id" ]] && {
+    pod.err "failed to find container id for $container"
+    return 1
+  }
+
+  local container_pid=$(pod.crictl inspect --output json $container_id | jq '.info.pid')
+  [[ -z "$container_pid" ]] && {
+    pod.err "failed to find container PID for $container | $container_id"
+    return 1
+  }
+
+  pod.info "found container $container: id: $container_id | pid: $container_pid"
+
+
+  local pcap_file="/tmp/$container.pcap"
+  pod.run nsenter -n -t $container_pid -- tcpdump -i any -nn -w "$pcap_file"
+}
+
+pod.tcpdump() {
+  local container=$1; shift
+  local capture_node_packets=$1; shift
+  $capture_node_packets && pod.tcpdump_node &
+  pod.tcpdump_pod "$container" &
+  wait
+
+}
+
+export_fns() {
+  local -a common_fn=(log qq)
+  declare -f ${common_fn[@]}
+  declare -f $(declare -F | grep "pod\." | cut -f3 -d ' ')
+}
+
+pod_exec() {
+  local ns="$1"; shift
+  local pod="$1"; shift
+  local fn="$1"; shift
+
+  ### construct the  script that will be run in the  pod
+  ### It will have all the `pod.*` functions exported at available
+  ### and will invoke pod.main with the <namspace> <pod> $@ as arguments
+  local pod_script
+  pod_script=$(cat <<-EOF
+
+$(export_fns)
+
+pod.$fn $@
+EOF
+)
+  oc exec -t -n "$ns" "$pod" -- bash -c "$pod_script"
+}
+
+container_name() {
+  echo "${PODS[0]}" | cut -f3 -d:
+}
+
+tcpdump_node() {
+  local node=$1; shift
+  local debug_pod=$1; shift
+  local container_name=$1; shift
+  local capture_node_packets=$1; shift
+
+  local container=$(container_name)
+  info "starting tcpdump on pod: $debug_pod to capture $container_name pod traffic"
+
+  pod_exec  $TCPDUMP_NS $debug_pod tcpdump $container $capture_node_packets  &
+  TCPDUMP_PIDS+=( $! )
+  return 0
+}
+
+# require find_pods to be called so that PODS has entires
+start_tcpdump_all_nodes() {
+  local capture_node_packets=$1; shift
+
+  local container_name=$(container_name)
+
+  h2 "Starting tcpdump of $container_name on all nodes "
+
+  local idx=0
+  for debug_pod in ${DEBUG_PODS[@]}; do
+    local node=${NODE_NAMES[$idx]}
+    tcpdump_node "$node" "$debug_pod" "$container_name" "$capture_node_packets"
+    (( idx++ )) || true   ### something is wrong; why does this error ?
+  done
+}
+
+start_debug_pods() {
+  h2 "Starting Debug Pods on all ${#PODS[@]} nodes ... "
+
+  for p in ${PODS[@]}; do
+    local node=$(echo $p | cut -f2 -d:)
+    start_debug_node "$node"
+  done
+
+}
+
+find_pods() {
+  PODS=($(oc get pods --no-headers \
+    -o 'custom-columns=N:metadata.name,X:spec.nodeName,C:spec.containers[0].name' "$@" |
+    tr -s ' ' : \
+  ))
+}
+
+usage() {
+  # exit with one if no exit value is provided
+  print_usage
+  exit ${1:-1}
+}
+
+print_usage() {
+
+  local app=$(basename $0 | tr '-' ' ')
+
+  read -r -d '' help <<-EOF_HELP || true
+
+A tool to run tcpdump on pods to capture all traffic
+
+Usage:
+  $app [--no-nodes] POD-SELECTOR
+  $app -h|--help
+
+Options:
+  --no-nodes: Do not capture the traffic from nodes
+
+Examples:
+
+  # Capture all DNS pods
+  $app -n openshift-dns
+
+  # Capture pods that has label app=nginx deployed to 'web' namespace
+  $app -n web -l app=nginx
+
+EOF_HELP
+
+  echo -e "$help"
+  return 0
+}
+
+
+declare  SHOW_USAGE=false
+declare  CAPTURE_NODE_PACKETS=true
+
+declare -a POD_ARGS=()
+parse_args() {
+  # parses all the args and extracts the script related args (-h, --no-nodes)
+  # and puts rest of the arguments in POD_ARGS array
+
+  [[  -z "$@" ]] && return 1
+
+  # while there are args parse them
+  while [[ -n "${1+xxx}" ]]; do
+    case $1 in
+    -h|--help)    SHOW_USAGE=true; return ;; # exit the loop
+    --no-nodes)   CAPTURE_NODE_PACKETS=false; shift ;;
+    *)   POD_ARGS+=( "$1" ); shift
+    esac
+  done
+  return 0
+}
+
+
+
+main() {
+  ## usage
+  parse_args "$@" || usage
+  $SHOW_USAGE && usage 0
+
+
+  info "Finding pods matching \"${POD_ARGS[@]}\""
+  find_pods "${POD_ARGS[@]}" || {
+    err "Failed to find pods matching \"${POD_ARGS[@]}\""
+    return 1
+  }
+  info "Found ${#PODS[@]} pods matching \"${POD_ARGS[@]}\""
+
+
+  ### ensure the ns is created before proceeding
+  oc create ns $TCPDUMP_NS || {
+    err "Failed to create $TCPDUMP_NS namespace"
+    return 1
+  }
+
+  h2 All pcaps will be copied to $LOCAL_PCAP_DIR
+  info Starting packet capture of all pods matching
+
+
+  ### cleanup only if the ns can be created
+  trap "cleanup $CAPTURE_NODE_PACKETS" EXIT
+  trap "exit 0" SIGINT
+  start_debug_pods
+  start_tcpdump_all_nodes $CAPTURE_NODE_PACKETS
+
+  ### sleep is propotional to the number of pods started
+  sleep $( bc <<< "3 + ${#PODS[@]} * 0.5" )
+  h2 tcpdump of all pods have started. Press Ctrl+C to stop
+  info All pcap files will be copied to $LOCAL_PCAP_DIR
+
+  sleep infinity
+  return $?
+}
+
+main "$@"
