@@ -1,4 +1,4 @@
-# OpenShift `tcpdump` Tool
+# OpenShift CoreDNS Monitor Tool
 
 A tool to monitor the usage of the CoreDNS deployment in OpenShift.
 
@@ -14,6 +14,6 @@ To gather the metrics from the DaemonSet:
 ```
 for POD in $(oc get pods -o name -n metrics-debug | grep monitor-coredns-daemonset); do
   echo "Gathering logs from Pod: ${POD:4}"
-  oc rsync ${POD:4}:/network-metrics.tar.gz ./"${POD:4}network-metrics.tar.gz"
+  oc cp ${POD:4}:/network-metrics.tar.gz "$(pwd)/${POD:4}-network-metrics.tar.gz"
 done
 ```
