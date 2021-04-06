@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: monitor-network-daemonset
+  namespace: monitor-network-debug
+  labels:
+    app: monitor-network-daemonset
+spec:
+  selector:
+    matchLabels:
+      app: monitor-network-daemonset
+  template:
+    metadata:
+      labels:
+        app: monitor-network-daemonset
+    spec:
+      # tolerations:
+      ## this toleration is to have the daemonset runnable on master nodes
+      ## remove it if your masters can't run pods
+      # - key: node-role.kubernetes.io/master
+      #  effect: NoSchedule
+      hostPID: true
+      hostIPC: true
+      hostNetwork: true
+      containers:
+      - name: monitor-network-daemonset
+        image: quay.io/support-tools/monitor-network:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
+          capabilities:
+            add: ["NET_ADMIN"]
+
