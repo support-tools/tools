@@ -318,6 +318,10 @@ Examples:
   # Capture pods that has label app=nginx deployed to 'web' namespace
   $app -n web -l app=nginx
 
+  # Capture pods that has label app=nginx deployed to 'web' namespace
+  # but do not capture node traffic
+  $app --no-nodes -n web -l app=nginx
+
 EOF_HELP
 
   echo -e "$help"
